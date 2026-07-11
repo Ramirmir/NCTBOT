@@ -2,6 +2,7 @@ import sys
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import bot  # noqa: E402
@@ -19,6 +20,35 @@ class StockTests(unittest.TestCase):
             bot.parse_stock(payload),
             bot.Stock(normal=("Rocket", "Spin"), mirage=("Kitsune", "Dragon")),
         )
+
+    def test_parse_gamersberg_payload(self) -> None:
+        payload = {
+            "success": True,
+            "data": [
+                {
+                    "normalStock": [{"name": "Rocket-Rocket"}, {"name": "Spin-Spin"}],
+                    "mirageStock": [{"name": "Kitsune"}, {"name": "Rocket-Rocket"}],
+                }
+            ],
+        }
+        self.assertEqual(
+            bot.parse_gamersberg_stock(payload),
+            bot.Stock(normal=("Rocket", "Spin"), mirage=("Kitsune", "Rocket")),
+        )
+
+    def test_three_json_sources_are_configured(self) -> None:
+        sources = bot.stock_sources()
+        self.assertEqual(len(sources), 3)
+        self.assertTrue(all(source.url.startswith("https://") for source in sources))
+
+    def test_all_source_failures_produce_a_clear_error(self) -> None:
+        source = bot.ApiSource("Unavailable", "https://example.invalid", bot.parse_stock, {})
+        with (
+            patch.object(bot, "stock_sources", return_value=(source, source, source)),
+            patch.object(bot, "read_json", side_effect=bot.BotError("network unavailable")),
+            self.assertRaisesRegex(bot.BotError, "All 3 public stock APIs failed"),
+        ):
+            bot.get_current_stock()
 
     def test_message_format_and_moscow_time(self) -> None:
         stock = bot.Stock(normal=("Rocket",), mirage=("Kitsune", "Dragon"))

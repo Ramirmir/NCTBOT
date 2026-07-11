@@ -19,7 +19,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -28,12 +28,11 @@ ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / "data" / "state.json"
 PENDING_MESSAGE_PATH = ROOT / "data" / "pending_message.txt"
 MOSCOW_TZ = timezone(timedelta(hours=3))
-HTTP_TIMEOUT_SECONDS = 20
+HTTP_TIMEOUT_SECONDS = 10
 
-# Public JSON endpoints. They can be replaced without a code change through
-# repository secrets STOCK_API_PRIMARY_URL and STOCK_API_FALLBACK_URL.
-DEFAULT_PRIMARY_API_URL = "https://blox-fruits-stock-api.vercel.app/api/stock"
-DEFAULT_FALLBACK_API_URL = "https://blox-fruits-api.onrender.com/api/bloxfruits/stock"
+DEFAULT_PRIMARY_API_URL = "https://www.gamersberg.com/api/v1/blox-fruits/stock"
+DEFAULT_FALLBACK_API_URL = "https://bloxyvalues.com/api/stock"
+DEFAULT_THIRD_API_URL = "https://bloxfruitscode.com/wp-json/bfs/v1/stock"
 
 
 class BotError(RuntimeError):
@@ -53,6 +52,16 @@ class Stock:
         }
 
 
+@dataclass(frozen=True)
+class ApiSource:
+    """A public JSON endpoint and the parser for its documented response."""
+
+    name: str
+    url: str
+    parser: Callable[[Any], Stock]
+    headers: dict[str, str]
+
+
 def required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -60,22 +69,23 @@ def required_env(name: str) -> str:
     return value
 
 
-def read_json(url: str) -> Any:
+def read_json(source: ApiSource) -> Any:
     request = Request(
-        url,
+        source.url,
         headers={
             "Accept": "application/json",
             "User-Agent": "blox-fruits-stock-telegram-bot/1.0",
+            **source.headers,
         },
     )
     try:
         with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             content_type = response.headers.get_content_type()
             if content_type not in {"application/json", "text/json"}:
-                raise BotError(f"{url} returned {content_type}, not JSON")
+                raise BotError(f"{source.name} returned {content_type}, not JSON")
             return json.loads(response.read().decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise BotError(f"Could not read stock API {url}: {error}") from error
+        raise BotError(f"Could not read {source.name} ({source.url}): {error}") from error
 
 
 def find_value(data: Any, keys: Iterable[str]) -> Any | None:
@@ -98,13 +108,34 @@ def find_value(data: Any, keys: Iterable[str]) -> Any | None:
 def fruit_name(value: Any) -> str | None:
     if isinstance(value, str):
         name = value.strip()
-        return name or None
+        return normalise_fruit_name(name) if name else None
     if isinstance(value, dict):
         for key in ("name", "fruit", "fruit_name", "item", "display_name"):
             candidate = value.get(key)
             if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
+                return normalise_fruit_name(candidate.strip())
     return None
+
+
+def normalise_fruit_name(name: str) -> str:
+    """Gamersberg emits names such as ``Rocket-Rocket``; show ``Rocket``."""
+    left, separator, right = name.partition("-")
+    if separator and left.casefold() == right.casefold():
+        return left
+    return name
+
+
+def unique_names(names: Iterable[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in names:
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(name)
+    if not result:
+        raise BotError("API response contained an empty stock list")
+    return tuple(result)
 
 
 def fruit_names(value: Any) -> tuple[str, ...]:
@@ -120,10 +151,7 @@ def fruit_names(value: Any) -> tuple[str, ...]:
     else:
         values = []
 
-    names = [name for item in values if (name := fruit_name(item))]
-    if not names:
-        raise BotError("API response contained an empty stock list")
-    return tuple(names)
+    return unique_names(name for item in values if (name := fruit_name(item)))
 
 
 def parse_stock(payload: Any) -> Stock:
@@ -134,21 +162,78 @@ def parse_stock(payload: Any) -> Stock:
     return Stock(normal=fruit_names(normal_raw), mirage=fruit_names(mirage_raw))
 
 
-def get_current_stock() -> Stock:
-    urls = (
-        os.getenv("STOCK_API_PRIMARY_URL", "").strip() or DEFAULT_PRIMARY_API_URL,
-        os.getenv("STOCK_API_FALLBACK_URL", "").strip() or DEFAULT_FALLBACK_API_URL,
+def parse_gamersberg_stock(payload: Any) -> Stock:
+    """Normalise Gamersberg's ``data: [{normalStock, mirageStock}]`` schema."""
+    records = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise BotError("Gamersberg response does not contain a data array")
+
+    normal: list[str] = []
+    mirage: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        normal.extend(fruit_names(record.get("normalStock", [])))
+        mirage.extend(fruit_names(record.get("mirageStock", [])))
+    return Stock(normal=unique_names(normal), mirage=unique_names(mirage))
+
+
+def stock_sources() -> tuple[ApiSource, ...]:
+    """Return three public JSON sources in fallback order.
+
+    The first two addresses remain overridable by existing repository secrets.
+    No credentials are required by any source.
+    """
+    gamersberg_url = os.getenv("STOCK_API_PRIMARY_URL", "").strip() or DEFAULT_PRIMARY_API_URL
+    bloxy_url = os.getenv("STOCK_API_FALLBACK_URL", "").strip() or DEFAULT_FALLBACK_API_URL
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0 Safari/537.36",
+    }
+    return (
+        ApiSource(
+            name="Gamersberg",
+            url=gamersberg_url,
+            parser=parse_gamersberg_stock,
+            headers={
+                **browser_headers,
+                "Referer": "https://www.gamersberg.com/blox-fruits/stock",
+                "Origin": "https://www.gamersberg.com",
+            },
+        ),
+        ApiSource(
+            name="Bloxy Values",
+            url=bloxy_url,
+            parser=parse_stock,
+            headers={
+                **browser_headers,
+                "Referer": "https://bloxyvalues.com/stock",
+                "Origin": "https://bloxyvalues.com",
+            },
+        ),
+        ApiSource(
+            name="BloxFruitsCode",
+            url=DEFAULT_THIRD_API_URL,
+            parser=parse_stock,
+            headers={
+                **browser_headers,
+                "Referer": "https://bloxfruitscode.com/blox-fruits-stock-live-right-now/",
+                "Origin": "https://bloxfruitscode.com",
+            },
+        ),
     )
+
+
+def get_current_stock() -> Stock:
     errors: list[str] = []
-    for url in dict.fromkeys(url for url in urls if url):
+    for source in stock_sources():
         try:
-            stock = parse_stock(read_json(url))
-            logging.info("Stock received from %s", url)
+            stock = source.parser(read_json(source))
+            logging.info("Stock received from %s", source.name)
             return stock
         except BotError as error:
-            logging.warning("Stock source failed: %s", error)
+            logging.warning("Stock source %s failed: %s", source.name, error)
             errors.append(str(error))
-    raise BotError("All stock APIs failed. " + " | ".join(errors))
+    raise BotError("All 3 public stock APIs failed. " + " | ".join(errors))
 
 
 def read_state() -> Stock | None:
