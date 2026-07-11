@@ -1,0 +1,58 @@
+name: Publish Blox Fruits Stock
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blox-fruits-stock-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TOPIC_ID: ${{ secrets.TOPIC_ID }}
+      # Optional overrides when a public provider changes its API URL.
+      STOCK_API_PRIMARY_URL: ${{ secrets.STOCK_API_PRIMARY_URL }}
+      STOCK_API_FALLBACK_URL: ${{ secrets.STOCK_API_FALLBACK_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore last published stock
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: blox-fruits-stock-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            blox-fruits-stock-
+
+      - name: Compare stock and prepare message
+        id: prepare
+        run: python src/bot.py --prepare
+
+      # The cache is saved before sending. This prevents an interrupted run
+      # from publishing the same stock a second time on its next execution.
+      - name: Persist new published state
+        if: steps.prepare.outputs.state_changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: blox-fruits-stock-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Send Telegram notification
+        if: steps.prepare.outputs.state_changed == 'true'
+        run: python src/bot.py --send
